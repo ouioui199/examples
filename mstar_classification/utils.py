@@ -216,3 +216,17 @@ class ToTensor:
         # Convert numpy array to PyTorch tensor and Rearrange dimensions from HWC to CHW
         tensor = torch.from_numpy(image).permute(2, 0, 1).to(self.dtype)
         return tensor
+    
+
+class LogTransform(complexTransform):
+    def __init__(self, minval, maxval):
+        self.minval = minval
+        self.maxval = maxval
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        amplitude = np.clip(np.abs(image), self.minval, self.maxval)
+        norm_amplitude = (np.log10(amplitude) - np.log10(self.minval)) / (
+            np.log10(self.maxval) - np.log10(self.minval)
+        )
+        angle = np.angle(image)
+        return norm_amplitude * np.exp(1j * angle)
