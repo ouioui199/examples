@@ -42,7 +42,8 @@ from utils import (
     train_parser, 
     get_dataloaders,
     get_datasets,
-    ToMagnitude
+    ToMagnitude,
+    LogTransform
 )
         
 def lightning_train_MSTAR(opt: ArgumentParser, trainer: Trainer):
@@ -50,6 +51,7 @@ def lightning_train_MSTAR(opt: ArgumentParser, trainer: Trainer):
     dataset = MSTARTargets(
         opt.datadir,
         transform=v2.Compose([
+            LogTransform(2e-2, 40),
             ToMagnitude(),
             v2.ToImage(),
             v2.Resize(opt.input_size),
@@ -114,4 +116,4 @@ if __name__ == '__main__':
     )
     
     torch.set_float32_matmul_precision('high')
-    lightning_train_SAMPLE(opt, trainer)
+    lightning_train_MSTAR(opt, trainer)

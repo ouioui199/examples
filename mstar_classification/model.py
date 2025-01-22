@@ -28,10 +28,10 @@ from argparse import ArgumentParser
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from torchvision.utils import make_grid
-from torchvision.models import resnet18, vgg11
+
 
 import lightning as L
 
@@ -184,7 +184,132 @@ class Model(nn.Module):
         mean_features = features.mean(dim=1)
 
         return self.head(mean_features)
+
+
+class Attention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
+        super().__init__()
+        
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** - 0.5
+        self.q_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads)
+        
+    def forward(self, x: Tensor) -> Tensor:
+        B, N, _ = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+        return self.scaled_dot_product_attention(q, k, v)
     
+    def scaled_dot_product_attention(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        q = q * self.scale
+        out = (q @ k.transpose(-2, -1)).softmax(dim=-1)
+        return out @ v
+
+
+class Block(nn.Module):
+    def __init__(
+        self, 
+        embed_dim: int, 
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float = 0.0
+    ) -> None:
+        super().__init__()
+        
+        self.attn = Attention(embed_dim, num_heads)
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        self.linear = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x: Tensor) -> Tensor:
+        # x = self.layer_norm(x)
+        B, N, C = x.shape
+        attn = self.attn(x).transpose(1, 2).reshape(B, N, C)
+        x = x + attn
+        x = x + self.linear(self.layer_norm(x))
+        # inp_x = self.layer_norm(x)
+        # x = x + self.attn(inp_x, inp_x, inp_x)[0]
+        # x = x + self.linear(self.layer_norm(x))
+        
+        return x
+    
+
+class VisionTranformer(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        num_channels: int,
+        num_heads: int,
+        num_layers: int,
+        num_classes: int,
+        patch_size: int,
+        num_patches: int,
+        dropout: float = 0.0
+        ) -> None:
+        
+        super().__init__()
+        
+        self.patch_size = patch_size
+        
+        self.input_layer = nn.Linear(num_channels * (patch_size ** 2), embed_dim)
+        self.transformer = nn.Sequential(
+            *(Block(
+                embed_dim,
+                hidden_dim, 
+                num_heads,
+                dropout=dropout
+            ) for _ in range(num_layers))
+        )
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes)
+        )
+        self.dropout = nn.Dropout(dropout)
+        
+        self.cls_token = nn.Parameter(torch.rand(1, 1, embed_dim))
+        self.pos_embedding = nn.Parameter(torch.rand(1, 1 + num_patches, embed_dim))
+        
+    def forward(self, x: Tensor) -> Tensor:
+        x = im_to_patch(x, self.patch_size)
+        B, T, _ = x.shape
+        x = self.input_layer(x)
+        
+        cls_token = self.cls_token.repeat(B, 1, 1)
+        x = torch.cat([cls_token, x], dim=1)
+        x = x + self.pos_embedding
+        
+        x = self.dropout(x)
+        # x = x.transpose(0, 1)
+        x = self.transformer(x)
+        
+        cls = x[:, 0] # position of cls_token
+        return self.mlp_head(cls)
+
+
+def im_to_patch(im, patch_size, flatten_channels: bool = True):
+    B, C, H, W = im.shape
+    assert H // patch_size != 0 and W // patch_size != 0, f"Image height and width are {H, W}, which is not a multiple of the patch size"
+    
+    im = im.reshape(B, C, H // patch_size, patch_size, W // patch_size, patch_size)
+    im = im.permute(0, 2, 4, 1, 3, 5)
+    im = im.flatten(1, 2)
+    
+    if flatten_channels:
+        return im.flatten(2, 4)
+    else:
+        return im
+
 
 class BaseResNetModule(L.LightningModule):
 
@@ -193,7 +318,18 @@ class BaseResNetModule(L.LightningModule):
 
         self.opt = opt
         self.ce_loss = nn.CrossEntropyLoss()
-        self.model = resnet18(num_classes=num_classes)
+        model_kwargs = {
+            "embed_dim": 256, #embedded dim of the transformer model
+            "hidden_dim": 512, #hidden dim of mlp layer in attention block
+            "num_heads": 8, #number of self attention head
+            "num_layers": 6, #number of attention layers
+            "patch_size": 16, #size of an image patch after splitting
+            "num_channels": 1, #number of input image channel
+            "num_patches": 64, #number of patches splitted from image
+            "num_classes": 16, #number of class for the classification task
+            "dropout": 0.2,
+        }
+        self.model = VisionTranformer(**model_kwargs)
         self.gradcam = GradCAM(self.model, 'layer3')
         self.accuracy = Accuracy(task='multiclass', num_classes=num_classes)
         self.confusion_matrix = ConfusionMatrix(task='multiclass', num_classes=num_classes)
@@ -203,13 +339,19 @@ class BaseResNetModule(L.LightningModule):
         self.test_step_outputs = {}
     
     def forward(self, x: Tensor) -> Tensor:
-        return self.model(x.repeat(1, 3, 1, 1))
+        return self.model(x)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
         optimizer = torch.optim.Adam(params=self.parameters(), lr=self.opt.lr)
+        scheduler = {
+            'scheduler': ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5),
+            'monitor': 'val_loss',
+            'interval': 'epoch',
+            'frequency': 1,
+        }
         return {
             'optimizer': optimizer,
-            # 'lr_scheduler': MultiStepLR(optimizer, milestones=[5, ], gamma=0.001)
+            'lr_scheduler': scheduler
         }
         
     def plot_gradcam(self, data: Tensor, logger_id: int) -> None:
@@ -237,8 +379,8 @@ class BaseResNetModule(L.LightningModule):
             self.train_step_outputs['step_loss'].append(loss)
             self.train_step_outputs['step_metrics'].append(acc)
             
-        if batch_idx == len(self.trainer.train_dataloader) - 1:
-            self.plot_gradcam(data, 0)
+        # if batch_idx == len(self.trainer.train_dataloader) - 1:
+        #     self.plot_gradcam(data, 0)
 
         return loss
 
@@ -292,7 +434,7 @@ class ResNetMSTARModule(BaseResNetModule):
     
     def training_step(self, batch: List[Tensor], batch_idx: int) -> Tensor:
         data, label = batch
-        return super()._training_step(data, label)
+        return super()._training_step(data, label, batch_idx)
 
     def validation_step(self, batch: List[Tensor], batch_idx: int) -> None:
         data, label = batch
