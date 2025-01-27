@@ -21,7 +21,6 @@
 # SOFTWARE.
 
 # Standard imports
-import random
 from argparse import ArgumentParser
 
 # External imports
@@ -34,6 +33,10 @@ from torchcvnn.datasets import MSTARTargets, SAMPLE
 from lightning import Trainer
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
+from torchmetrics import ConfusionMatrix, Accuracy
+
+import seaborn as sns
+from matplotlib import pyplot as plt
 # Local imports
 from model import ResNetMSTARModule, ResNetSAMPLEModule
 from utils import (
@@ -63,8 +66,29 @@ def lightning_train_MSTAR(opt: ArgumentParser, trainer: Trainer):
     train_loader, valid_loader = get_dataloaders(opt, train_dataset, valid_dataset)
     model = ResNetMSTARModule(opt, num_classes=len(dataset.class_names))
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=valid_loader)
-    # predictions = trainer.predict(dataloaders=valid_loader)
-    # print(predictions)
+    # Predict
+    predictions = trainer.predict(dataloaders=valid_loader)
+    preds = torch.cat([pred[0].softmax(-1) for pred in predictions], 0)
+    labels = torch.cat([label[1] for label in predictions], 0)
+    # Plot ConfusionMatrix
+    confusion = ConfusionMatrix(task='multiclass', num_classes=len(dataset.class_names))
+    confusion.update(preds, labels)
+    confusion_matrix = confusion.compute().numpy()
+    confusion_matrix = confusion_matrix / confusion_matrix.sum(axis=1, keepdims=True)
+
+    plt.figure(figsize=(12.5,10))
+    sns.heatmap(confusion_matrix, fmt='d', cmap='Blues', xticklabels=dataset.class_names, yticklabels=dataset.class_names)
+    plt.savefig('ConfusionMatrix.png')
+    plt.show()
+    
+    accuracy_1 = Accuracy(task='multiclass', num_classes=len(dataset.class_names))
+    accuracy_1 = accuracy_1(preds, labels)
+    print(f'Accuracy top-1: {accuracy_1.item()}')
+    
+    accuracy_2 = Accuracy(task='multiclass', num_classes=len(dataset.class_names), top_k=5)
+    accuracy_2 = accuracy_2(preds, labels)
+    print(f'Accuracy top-5: {accuracy_2.item()}')
+
 
 def lightning_train_SAMPLE(opt: ArgumentParser, trainer: Trainer):
     # Dataloading
